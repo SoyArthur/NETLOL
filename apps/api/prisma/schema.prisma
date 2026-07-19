@@ -1,0 +1,315 @@
+// NetLOL schema — works with SQLite (dev) AND PostgreSQL (Supabase prod).
+// Detect provider via DATABASE_URL scheme:
+//   file:...           → sqlite (dev)
+//   postgresql://...   → postgresql (prod)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  // Local dev uses SQLite (file:../../db/dev.db). For Render production,
+  // change this to "postgresql" and point DATABASE_URL at your Render
+  // Postgres connection string. (Newer Prisma CLI doesn't allow env()
+  // in the provider argument.)
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ── PROFILES (humans) ──────────────────────────────────────────
+model Profile {
+  id                  String   @id @default(cuid())
+  email               String   @unique
+  passwordHash        String
+  username            String   @unique
+  avatarUrl           String?
+  role                String   @default("user") // user | admin  (admin is hidden from UI)
+  plan                String   @default("free") // free | pro | team
+  planExpiresAt       DateTime?
+  vetoTimeoutSeconds  Int      @default(30)
+  walletAddress       String?
+  walletChain         String   @default("solana") // solana | evm | bitcoin
+  createdAt           DateTime @default(now())
+
+  agents       Agent[]
+  apiKeys      ApiKey[]
+  servers      Server[]      @relation("ServerOwner")
+  groupChats   GroupChat[]   @relation("GcOwner")
+  payments     Payment[]
+}
+
+// ── AGENTS ─────────────────────────────────────────────────────
+model Agent {
+  id                 String   @id @default(cuid())
+  uid                String   @unique // agt_{nanoid8}
+  ownerId            String
+  name               String
+  description       String?
+  avatarUrl         String?
+  capabilities      Json // string[]
+  languages         Json     @default("[\"en\"]")
+  acceptsUnsolicited Boolean  @default(true)
+  byokProvider      String?  // openai | anthropic | google | openai-compat
+  byokBaseUrl       String?
+  model             String?
+  pricingModel      String   @default("free") // free | fixed | credits
+  pricePerRequest   Float    @default(0)
+  dailyBudgetUsd    Float?
+  spentToday        Float    @default(0)
+  spentTodayReset   DateTime @default(now())
+  walletAddress     String?
+  walletChain       String   @default("solana")
+  online            Boolean  @default(false)
+  lastSeen          DateTime?
+  createdAt         DateTime @default(now())
+
+  owner             Profile       @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  secret            AgentSecret?
+  tools             AgentTool[]
+  reputation        Reputation?
+  handshakesReq     Handshake[]   @relation("HandshakeRequester")
+  handshakesRcv     Handshake[]   @relation("HandshakeReceiver")
+  serverMembers     ServerMember[]
+  gcMembers         GcMember[]
+  conversationsA    Conversation[] @relation("ConvAgentA")
+  conversationsB    Conversation[] @relation("ConvAgentB")
+  messages          MessageEvent[]
+}
+
+model AgentSecret {
+  agentId          String   @id
+  llmKeyEncrypted  String
+  updatedAt        DateTime @default(now())
+  agent            Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+}
+
+model AgentTool {
+  id          String   @id @default(cuid())
+  agentId     String
+  name        String
+  description String?
+  type        String   // function | mcp | webhook
+  config      Json
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  agent       Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+}
+
+// ── API KEYS ───────────────────────────────────────────────────
+model ApiKey {
+  id          String   @id @default(cuid())
+  ownerId     String
+  keyHash     String   @unique
+  keyPrefix   String
+  label       String?
+  agentIds    Json // string[]
+  lastUsedAt  DateTime?
+  createdAt   DateTime @default(now())
+  owner       Profile  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+}
+
+// ── HANDSHAKES ─────────────────────────────────────────────────
+model Handshake {
+  id                 String    @id @default(cuid())
+  requesterAgentId   String
+  receiverAgentId    String
+  requestSummary     String
+  accepted           Boolean
+  reason             String?
+  estimatedCost      Float?
+  paymentRequired    Boolean   @default(false)
+  paymentAmount      Float?
+  paymentAddress     String?
+  paymentChain       String?
+  vetoExpiresAt      DateTime?
+  vetoedByHuman      Boolean   @default(false)
+  paymentTx          String?
+  paymentConfirmed   Boolean   @default(false)
+  status             String    @default("pending") // pending | accepted | rejected | vetoed | confirmed | failed
+  createdAt          DateTime  @default(now())
+  resolvedAt         DateTime?
+
+  requester          Agent     @relation("HandshakeRequester", fields: [requesterAgentId], references: [id])
+  receiver           Agent     @relation("HandshakeReceiver", fields: [receiverAgentId], references: [id])
+  payments           PaymentP2P[]
+}
+
+// ── REPUTATION ─────────────────────────────────────────────────
+model Reputation {
+  agentId          String    @id
+  jobsCompleted     Int       @default(0)
+  jobsFailed        Int       @default(0)
+  jobsVetoed        Int       @default(0)
+  totalEarnedUsd    Float     @default(0)
+  totalSpentUsd     Float     @default(0)
+  avgResponseMs     Int       @default(0)
+  successRate       Float     @default(0) // 0–100
+  verified          Boolean   @default(false)
+  updatedAt         DateTime  @default(now())
+  agent             Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
+}
+
+// ── PAYMENTS P2P ───────────────────────────────────────────────
+model PaymentP2P {
+  id            String    @id @default(cuid())
+  handshakeId   String?
+  payerAgentId  String
+  payeeAgentId  String
+  amountUsd     Float
+  walletChain   String
+  txSignature   String?
+  status        String    @default("pending") // pending | confirmed | failed
+  createdAt     DateTime  @default(now())
+  confirmedAt   DateTime?
+  handshake     Handshake? @relation(fields: [handshakeId], references: [id])
+}
+
+// ── DMs ────────────────────────────────────────────────────────
+model Conversation {
+  id             String    @id @default(cuid())
+  threadId       String    @unique
+  agentAId       String
+  agentBId       String
+  budgetCap      Float?
+  spent          Float     @default(0)
+  lastMessageAt  DateTime?
+  createdAt       DateTime  @default(now())
+
+  agentA         Agent     @relation("ConvAgentA", fields: [agentAId], references: [id])
+  agentB         Agent     @relation("ConvAgentB", fields: [agentBId], references: [id])
+}
+
+// ── SERVERS ────────────────────────────────────────────────────
+model Server {
+  id            String   @id @default(cuid())
+  slug          String   @unique
+  name          String
+  avatarUrl     String?
+  description   String?
+  isPublic      Boolean  @default(true)
+  createdById   String?
+  ownerHumanId  String
+  createdAt     DateTime @default(now())
+
+  owner         Profile        @relation("ServerOwner", fields: [ownerHumanId], references: [id])
+  channels      ServerChannel[]
+  roles         ServerRole[]
+  members       ServerMember[]
+}
+
+model ServerChannel {
+  id        String   @id @default(cuid())
+  serverId  String
+  name      String
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  server    Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+}
+
+model ServerRole {
+  id          String   @id @default(cuid())
+  serverId    String
+  name        String
+  color       String?
+  permissions Json // bitmask keys: read,write,kick,ban,...
+  position    Int      @default(0)
+  createdAt   DateTime @default(now())
+  server      Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+}
+
+model ServerMember {
+  id        String   @id @default(cuid())
+  serverId  String
+  agentId   String
+  roleIds   Json // string[]
+  isAdmin   Boolean  @default(false)
+  joinedAt  DateTime @default(now())
+  server    Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  agent     Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([serverId, agentId])
+}
+
+// ── GROUP CHATS ───────────────────────────────────────────────
+model GroupChat {
+  id             String    @id @default(cuid())
+  threadId       String    @unique
+  name           String
+  avatarUrl      String?
+  isPublic       Boolean   @default(true)
+  maxMembers     Int?
+  createdById    String?
+  ownerHumanId   String
+  lastMessageAt  DateTime?
+  createdAt      DateTime  @default(now())
+
+  owner          Profile   @relation("GcOwner", fields: [ownerHumanId], references: [id])
+  roles          GcRole[]
+  members        GcMember[]
+}
+
+model GcRole {
+  id          String   @id @default(cuid())
+  gcId        String
+  name        String
+  permissions Json
+  createdAt    DateTime @default(now())
+  gc           GroupChat @relation(fields: [gcId], references: [id], onDelete: Cascade)
+}
+
+model GcMember {
+  id        String    @id @default(cuid())
+  gcId      String
+  agentId   String
+  roleId    String?
+  isAdmin   Boolean   @default(false)
+  joinedAt  DateTime  @default(now())
+  gc        GroupChat @relation(fields: [gcId], references: [id], onDelete: Cascade)
+  agent     Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([gcId, agentId])
+}
+
+// ── PLAN PAYMENTS ──────────────────────────────────────────────
+model Payment {
+  id            String    @id @default(cuid())
+  ownerId       String
+  provider      String
+  chargeId      String?
+  txSignature   String?
+  amountUsd     Float
+  plan          String
+  periodMonths  Int       @default(1)
+  status        String    @default("pending")
+  createdAt     DateTime  @default(now())
+  owner         Profile   @relation(fields: [ownerId], references: [id])
+}
+
+// ── MESSAGE EVENTS (user-owned content) ───────────────────────
+model MessageEvent {
+  id                  String    @id @default(cuid())
+  threadId            String
+  senderAgentId       String?
+  content             String
+  contentHash         String?
+  sentByHuman         Boolean   @default(false)
+  hasAttachment       Boolean   @default(false)
+  attachmentName      String?
+  attachmentSizeBytes Int?
+  createdAt           DateTime  @default(now())
+
+  sender              Agent?     @relation(fields: [senderAgentId], references: [id])
+}
+
+// ── DELEGATION CHAINS (private audit) ─────────────────────────
+model DelegationChain {
+  id                String    @id @default(cuid())
+  chainId           String    @unique
+  originAgentId     String?
+  maxDepth          Int       @default(3)
+  currentDepth      Int       @default(0)
+  remainingBudget   Float?
+  hops              Json      @default("[]")
+  createdAt         DateTime  @default(now())
+  closedAt          DateTime?
+}
